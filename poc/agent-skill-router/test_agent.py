@@ -24,7 +24,7 @@ from openclaw_agent.system_prompt import (
     build_system_prompt,
     format_skills_for_prompt,
 )
-from openclaw_agent.router import RoutingResult, SkillRouter
+from openclaw_agent.router import RoutingResult, ExecutionResult, SkillRouter
 
 
 # ---------------------------------------------------------------------------
@@ -402,3 +402,256 @@ class TestSkillRouter:
         assert result.selected_skill is not None
         assert result.selected_skill.name == "translation"
         assert (tmp_path / "translation" / "SKILL.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# skill_manager tests
+# ---------------------------------------------------------------------------
+
+
+from openclaw_agent.skill_manager import SkillManager
+
+
+class TestSkillManager:
+    def test_create_and_get(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        created = mgr.create("test-skill", "A test skill.", "# Test\n\nBody.")
+        assert created is not None
+        assert created.name == "test-skill"
+        assert mgr.get("test-skill") is not None
+        assert (tmp_path / "test-skill" / "SKILL.md").exists()
+
+    def test_create_rejects_invalid_name(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        assert mgr.create("../bad", "Bad", "# Bad") is None
+        assert mgr.create("", "Empty", "# Empty") is None
+        assert mgr.create("-leading", "Bad", "# Bad") is None
+
+    def test_create_rejects_duplicate(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        mgr.create("dupe", "First.", "# First")
+        assert mgr.create("dupe", "Second.", "# Second") is None
+
+    def test_list_names(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        mgr.create("beta", "B.", "# B")
+        mgr.create("alpha", "A.", "# A")
+        assert mgr.list_names() == ["alpha", "beta"]
+
+    def test_update(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        mgr.create("updatable", "Old desc.", "# Old body")
+        updated = mgr.update("updatable", description="New desc.")
+        assert updated is not None
+        assert updated.description == "New desc."
+        assert updated.body == "# Old body"  # body unchanged
+
+    def test_update_body(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        mgr.create("updatable", "Desc.", "# Old body")
+        updated = mgr.update("updatable", body="# New body")
+        assert updated is not None
+        assert updated.body == "# New body"
+
+    def test_update_nonexistent(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        assert mgr.update("ghost", description="x") is None
+
+    def test_delete(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        mgr.create("doomed", "To delete.", "# Doomed")
+        assert mgr.delete("doomed") is True
+        assert mgr.get("doomed") is None
+        assert not (tmp_path / "doomed").exists()
+
+    def test_delete_nonexistent(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        assert mgr.delete("ghost") is False
+
+    def test_reload(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        mgr.create("reload-test", "Desc.", "# Body")
+        mgr2 = SkillManager(str(tmp_path))
+        assert mgr2.get("reload-test") is not None
+
+    def test_create_with_emoji(self, tmp_path: Path):
+        mgr = SkillManager(str(tmp_path))
+        created = mgr.create("emoji-skill", "Has emoji.", "# Body", emoji="🎉")
+        assert created is not None
+        assert created.emoji == "🎉"
+
+
+# ---------------------------------------------------------------------------
+# skill execution tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkillExecution:
+    def test_extract_commands_bash(self):
+        skill = Skill(
+            name="test",
+            description="",
+            file_path="",
+            body="# Test\n\n```bash\necho hello\necho world\n```\n",
+        )
+        cmds = SkillRouter.extract_commands(skill)
+        assert cmds == ["echo hello", "echo world"]
+
+    def test_extract_commands_shell(self):
+        skill = Skill(
+            name="test",
+            description="",
+            file_path="",
+            body="# Test\n\n```shell\nls -la\n```\n",
+        )
+        cmds = SkillRouter.extract_commands(skill)
+        assert cmds == ["ls -la"]
+
+    def test_extract_commands_skips_non_shell(self):
+        skill = Skill(
+            name="test",
+            description="",
+            file_path="",
+            body="# Test\n\n```python\nprint('hi')\n```\n",
+        )
+        cmds = SkillRouter.extract_commands(skill)
+        assert cmds == []
+
+    def test_extract_commands_skips_comments(self):
+        skill = Skill(
+            name="test",
+            description="",
+            file_path="",
+            body="# Test\n\n```bash\n# comment\necho ok\n```\n",
+        )
+        cmds = SkillRouter.extract_commands(skill)
+        assert cmds == ["echo ok"]
+
+    def test_extract_commands_no_blocks(self):
+        skill = Skill(
+            name="test",
+            description="",
+            file_path="",
+            body="# No code blocks here.",
+        )
+        cmds = SkillRouter.extract_commands(skill)
+        assert cmds == []
+
+    def test_execute_skill_success(self, sample_skills: list[Skill], tmp_path: Path):
+        skill = Skill(
+            name="echo-test",
+            description="Test.",
+            file_path="",
+            body="# Echo\n\n```bash\necho hello-world\n```\n",
+        )
+        router = SkillRouter([skill], workspace_dir=str(tmp_path), api_key="")
+        result = router.execute_skill(skill)
+        assert result.success
+        assert "hello-world" in result.stdout
+        assert result.command == "echo hello-world"
+
+    def test_execute_skill_no_commands(self, tmp_path: Path):
+        skill = Skill(
+            name="empty", description="", file_path="", body="# No commands"
+        )
+        router = SkillRouter([skill], workspace_dir=str(tmp_path), api_key="")
+        result = router.execute_skill(skill)
+        assert not result.success
+        assert "No executable commands" in result.stderr
+
+    def test_execute_skill_index_out_of_range(self, tmp_path: Path):
+        skill = Skill(
+            name="one-cmd",
+            description="",
+            file_path="",
+            body="```bash\necho ok\n```\n",
+        )
+        router = SkillRouter([skill], workspace_dir=str(tmp_path), api_key="")
+        result = router.execute_skill(skill, command_index=5)
+        assert not result.success
+        assert "out of range" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# router management integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestRouterManagement:
+    def test_list_skills(self, sample_skills: list[Skill]):
+        router = SkillRouter(sample_skills, api_key="")
+        listing = router.list_skills()
+        assert len(listing) == 3
+        names = {s["name"] for s in listing}
+        assert names == {"weather", "github", "coding"}
+
+    def test_update_skill(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        # First create a skill that's managed on disk
+        router._create_skill_from_args({
+            "skill_name": "managed",
+            "description": "Old.",
+            "body": "# Old",
+        })
+        updated = router.update_skill("managed", description="New description.")
+        assert updated is not None
+        assert updated.description == "New description."
+        # Verify prompt was rebuilt
+        assert "New description." in router.system_prompt
+
+    def test_delete_skill(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        router._create_skill_from_args({
+            "skill_name": "temp",
+            "description": "Temporary.",
+            "body": "# Temp",
+        })
+        assert router.delete_skill("temp") is True
+        assert router._find_skill_by_name("temp") is None
+        assert "temp" not in router.system_prompt
+
+    def test_handle_tool_call_update(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        router._create_skill_from_args({
+            "skill_name": "editable",
+            "description": "Before.",
+            "body": "# Before",
+        })
+        result = router._handle_tool_call("update_skill", {
+            "skill_name": "editable",
+            "description": "After.",
+            "response": "Updated!",
+        })
+        assert result.response == "Updated!"
+        assert router._find_skill_by_name("editable").description == "After."
+
+    def test_handle_tool_call_delete(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        router._create_skill_from_args({
+            "skill_name": "deleteme",
+            "description": "Bye.",
+            "body": "# Bye",
+        })
+        result = router._handle_tool_call("delete_skill", {
+            "skill_name": "deleteme",
+            "response": "Deleted!",
+        })
+        assert result.response == "Deleted!"
+        assert router._find_skill_by_name("deleteme") is None
+
+    def test_handle_tool_call_list(self, sample_skills: list[Skill]):
+        router = SkillRouter(sample_skills, api_key="")
+        result = router._handle_tool_call("list_skills", {
+            "response": "Here are the skills...",
+        })
+        assert "Here are the skills" in result.response
+
+    def test_created_flag_set(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        result = router._handle_tool_call("create_skill", {
+            "skill_name": "new-one",
+            "description": "New.",
+            "body": "# New",
+            "response": "Created!",
+        })
+        assert result.created is True
