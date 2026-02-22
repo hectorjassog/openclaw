@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_loader import Skill
+from .skill_loader import Skill, _parse_skill
 from .system_prompt import build_system_prompt
 
 # Cache the OpenAI import so we don't retry on every call
@@ -274,7 +274,7 @@ class SkillRouter:
 
     def _create_skill_from_args(self, args: dict[str, str]) -> Skill | None:
         skill_name = str(args.get("skill_name", "")).strip().lower()
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", skill_name):
+        if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", skill_name):
             return None
 
         description = str(args.get("description", "")).strip()
@@ -283,11 +283,21 @@ class SkillRouter:
             return None
 
         skill_dir = Path(self.workspace_dir) / skill_name
+        if skill_dir.exists() and not skill_dir.is_dir():
+            return None
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / "SKILL.md"
         if skill_path.exists():
             existing = self._find_skill_by_name(skill_name)
-            return existing
+            if existing is not None:
+                return existing
+            parsed = _parse_skill(str(skill_path))
+            if parsed is not None:
+                self.skills.append(parsed)
+                self._system_prompt = build_system_prompt(
+                    self.skills, workspace_dir=self.workspace_dir,
+                )
+            return parsed
 
         skill_path.write_text(
             "\n".join([
