@@ -81,7 +81,8 @@ def main() -> None:
     print(f"  Skills: {len(skills)} loaded")
     for skill in skills:
         emoji = f"{skill.emoji} " if skill.emoji else ""
-        print(f"    - {emoji}{skill.name}: {skill.description[:70]}...")
+        desc = skill.description[:70] + ("..." if len(skill.description) > 70 else "")
+        print(f"    - {emoji}{skill.name}: {desc}")
     print()
     print('Type a message (or "quit" to exit):')
     print()

@@ -19,6 +19,24 @@ from dataclasses import dataclass, field
 from .skill_loader import Skill
 from .system_prompt import build_system_prompt
 
+# Cache the OpenAI import so we don't retry on every call
+_openai_class: type | None = None
+_openai_checked = False
+
+
+def _get_openai_client_class() -> type | None:
+    """Return the OpenAI client class, or None if not installed."""
+    global _openai_class, _openai_checked  # noqa: PLW0603
+    if not _openai_checked:
+        try:
+            from openai import OpenAI  # type: ignore[import-untyped]
+
+            _openai_class = OpenAI
+        except ImportError:
+            _openai_class = None
+        _openai_checked = True
+    return _openai_class
+
 
 @dataclass
 class RoutingResult:
@@ -77,10 +95,8 @@ class SkillRouter:
 
     def _route_via_llm(self, user_message: str) -> RoutingResult:
         """Send the message to an OpenAI-compatible chat API."""
-        # Late import so the POC works without openai installed (keyword mode)
-        try:
-            from openai import OpenAI  # type: ignore[import-untyped]
-        except ImportError:
+        OpenAI = _get_openai_client_class()
+        if OpenAI is None:
             return self._route_via_keywords(user_message)
 
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)

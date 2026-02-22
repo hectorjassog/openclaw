@@ -16,6 +16,10 @@ from pathlib import Path
 
 import yaml
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SkillRequirements:
@@ -61,7 +65,8 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 
     try:
         frontmatter = yaml.safe_load(frontmatter_str) or {}
-    except yaml.YAMLError:
+    except yaml.YAMLError as exc:
+        logger.warning("Failed to parse YAML frontmatter: %s", exc)
         frontmatter = {}
 
     return frontmatter, body
