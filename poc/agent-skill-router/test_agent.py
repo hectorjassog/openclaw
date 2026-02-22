@@ -243,6 +243,7 @@ class TestBuildSkillsSection:
         section = build_skills_section(sample_skills)
         assert "## Skills (mandatory)" in section
         assert "scan <available_skills>" in section
+        assert "create a new skill" in section
         assert "weather" in section
 
 
@@ -338,3 +339,66 @@ class TestSkillRouter:
         router = SkillRouter(sample_skills, api_key="")
         result = router.route("Check the weather")
         assert result.mode == "keyword"
+
+    def test_create_skill_from_args(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        created = router._create_skill_from_args(
+            {
+                "skill_name": "translation",
+                "description": "Translate text between languages.",
+                "body": "# Translation\n\nTranslate text accurately.",
+            },
+        )
+        assert created is not None
+        assert created.name == "translation"
+        assert (tmp_path / "translation" / "SKILL.md").exists()
+
+    def test_create_skill_rejects_invalid_name(self, sample_skills: list[Skill], tmp_path: Path):
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="")
+        created = router._create_skill_from_args(
+            {
+                "skill_name": "../bad",
+                "description": "Bad",
+                "body": "# Bad",
+            },
+        )
+        assert created is None
+
+    def test_route_via_llm_can_create_skill(self, sample_skills: list[Skill], tmp_path: Path, monkeypatch):
+        class _FakeToolCall:
+            def __init__(self):
+                self.function = type(
+                    "Fn", (),
+                    {
+                        "name": "create_skill",
+                        "arguments": (
+                            '{"skill_name":"translation","description":"Translate text.","'
+                            'body":"# Translation\\n\\nUse translation tooling.","'
+                            'response":"[Skill: translation] Created and selected translation skill."}'
+                        ),
+                    },
+                )()
+
+        class _FakeChoice:
+            def __init__(self):
+                self.message = type(
+                    "Msg", (),
+                    {"tool_calls": [_FakeToolCall()], "content": ""},
+                )()
+
+        class _FakeCompletions:
+            @staticmethod
+            def create(**_kwargs):
+                return type("Resp", (), {"choices": [_FakeChoice()]})()
+
+        class _FakeClient:
+            def __init__(self, **_kwargs):
+                self.chat = type("Chat", (), {"completions": _FakeCompletions()})()
+
+        monkeypatch.setattr("openclaw_agent.router._get_openai_client_class", lambda: _FakeClient)
+        router = SkillRouter(sample_skills, workspace_dir=str(tmp_path), api_key="test-key")
+        result = router.route("Translate hello to Spanish")
+        assert result.mode == "llm"
+        assert result.selected_skill is not None
+        assert result.selected_skill.name == "translation"
+        assert (tmp_path / "translation" / "SKILL.md").exists()
