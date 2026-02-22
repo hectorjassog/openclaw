@@ -67,7 +67,7 @@ def main() -> None:
         print("No skills found. Check --skills-dir path.", file=sys.stderr)
         sys.exit(1)
 
-    router = SkillRouter(skills, model=args.model)
+    router = SkillRouter(skills, model=args.model, workspace_dir=args.skills_dir)
 
     # Show prompt mode
     if args.show_prompt:

@@ -15,6 +15,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .skill_loader import Skill
 from .system_prompt import build_system_prompt
@@ -106,8 +107,8 @@ class SkillRouter:
             {"role": "user", "content": user_message},
         ]
 
-        # Ask the model to return structured JSON with the skill selection
-        tool_def = {
+        # Ask the model to return structured JSON with skill selection/creation.
+        select_skill_tool = {
             "type": "function",
             "function": {
                 "name": "select_skill",
@@ -132,11 +133,42 @@ class SkillRouter:
             },
         }
 
+        create_skill_tool = {
+            "type": "function",
+            "function": {
+                "name": "create_skill",
+                "description": (
+                    "Create a new skill when none of the available skills fit the user's request."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill_name": {
+                            "type": "string",
+                            "description": "Short skill name (letters, numbers, dashes).",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "One-line description for the new skill.",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "SKILL.md body content for the new skill.",
+                        },
+                        "response": {
+                            "type": "string",
+                            "description": "Response to send to the user after skill creation.",
+                        },
+                    },
+                    "required": ["skill_name", "description", "body", "response"],
+                },
+            },
+        }
+
         completion = client.chat.completions.create(
             model=self.model,
             messages=messages,
-            tools=[tool_def],
-            tool_choice={"type": "function", "function": {"name": "select_skill"}},
+            tools=[select_skill_tool, create_skill_tool],
         )
 
         choice = completion.choices[0]
@@ -149,13 +181,24 @@ class SkillRouter:
             except json.JSONDecodeError:
                 args = {"skill_name": "", "response": choice.message.content or ""}
 
-            skill_name = args.get("skill_name", "")
-            response_text = args.get("response", "")
+            if call.function.name == "create_skill":
+                created = self._create_skill_from_args(args)
+                selected = created
+                response_text = args.get("response", "")
+                if not response_text:
+                    if created:
+                        response_text = (
+                            f"[Skill: {created.name}] Created a new skill for this request."
+                        )
+                    else:
+                        response_text = "Couldn't create a new skill, so I'll continue without one."
+            else:
+                skill_name = args.get("skill_name", "")
+                selected = self._find_skill_by_name(skill_name)
+                response_text = args.get("response", "")
         else:
-            skill_name = ""
+            selected = None
             response_text = choice.message.content or ""
-
-        selected = self._find_skill_by_name(skill_name)
 
         return RoutingResult(
             selected_skill=selected,
@@ -228,3 +271,45 @@ class SkillRouter:
             if skill.name.lower() == name_lower:
                 return skill
         return None
+
+    def _create_skill_from_args(self, args: dict[str, str]) -> Skill | None:
+        skill_name = str(args.get("skill_name", "")).strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", skill_name):
+            return None
+
+        description = str(args.get("description", "")).strip()
+        body = str(args.get("body", "")).strip()
+        if not description or not body:
+            return None
+
+        skill_dir = Path(self.workspace_dir) / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+        if skill_path.exists():
+            existing = self._find_skill_by_name(skill_name)
+            return existing
+
+        skill_path.write_text(
+            "\n".join([
+                "---",
+                f"name: {skill_name}",
+                f'description: "{description}"',
+                "---",
+                "",
+                body,
+                "",
+            ]),
+            encoding="utf-8",
+        )
+
+        created = Skill(
+            name=skill_name,
+            description=description,
+            file_path=str(skill_path),
+            body=body,
+        )
+        self.skills.append(created)
+        self._system_prompt = build_system_prompt(
+            self.skills, workspace_dir=self.workspace_dir,
+        )
+        return created
