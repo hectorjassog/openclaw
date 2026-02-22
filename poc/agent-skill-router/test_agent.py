@@ -537,6 +537,16 @@ class TestSkillExecution:
         cmds = SkillRouter.extract_commands(skill)
         assert cmds == []
 
+    def test_extract_commands_skips_untagged(self):
+        skill = Skill(
+            name="test",
+            description="",
+            file_path="",
+            body="# Test\n\n```\necho should-be-skipped\n```\n",
+        )
+        cmds = SkillRouter.extract_commands(skill)
+        assert cmds == []
+
     def test_execute_skill_success(self, sample_skills: list[Skill], tmp_path: Path):
         skill = Skill(
             name="echo-test",

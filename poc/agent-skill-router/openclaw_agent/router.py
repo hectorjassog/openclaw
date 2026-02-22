@@ -525,7 +525,12 @@ class SkillRouter:
 
     @staticmethod
     def extract_commands(skill: Skill) -> list[str]:
-        """Extract shell commands from fenced code blocks in a skill body."""
+        """Extract shell commands from fenced code blocks in a skill body.
+
+        Only code blocks tagged with an explicit shell language (bash, sh,
+        shell, zsh) are considered. Untagged code blocks are skipped to
+        avoid accidentally running non-shell code.
+        """
         commands: list[str] = []
         in_block = False
         is_shell = False
@@ -535,7 +540,7 @@ class SkillRouter:
             stripped = line.strip()
             if stripped.startswith("```") and not in_block:
                 lang = stripped[3:].strip().lower()
-                is_shell = lang in ("bash", "sh", "shell", "zsh", "")
+                is_shell = lang in ("bash", "sh", "shell", "zsh")
                 in_block = True
                 current = []
             elif stripped == "```" and in_block:

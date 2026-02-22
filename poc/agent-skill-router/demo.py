@@ -171,9 +171,10 @@ def _handle_command(cmd: str, router: SkillRouter) -> bool:
         return True
 
     if command == "/reload":
+        from openclaw_agent.system_prompt import build_system_prompt as _build_prompt
         router.manager.reload()
         router.skills = router.manager.skills
-        router._system_prompt = router.system_prompt  # rebuild
+        router._system_prompt = _build_prompt(router.skills, workspace_dir=router.workspace_dir)
         print(f"  Reloaded {len(router.skills)} skills.\n")
         return True
 
