@@ -1,0 +1,5 @@
+# Required
+pyyaml>=6.0
+
+# Optional — only needed for LLM-based routing
+# openai>=1.0
