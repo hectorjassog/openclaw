@@ -7,6 +7,9 @@ to the appropriate skill via the LLM's own reasoning.
 Supports two modes:
 1. **LLM mode** (default): uses OpenAI-compatible API to route via a real model
 2. **Keyword mode** (fallback): simple keyword matching when no API key is available
+
+Also provides skill management tools (list, update, delete) and skill execution
+so the POC can handle the full skill lifecycle.
 """
 
 from __future__ import annotations
@@ -14,10 +17,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .skill_loader import Skill, _parse_skill
+from .skill_manager import SkillManager
 from .system_prompt import build_system_prompt
 
 # Cache the OpenAI import so we don't retry on every call
@@ -47,6 +52,22 @@ class RoutingResult:
     response: str
     all_skills: list[Skill] = field(default_factory=list)
     mode: str = "keyword"  # "llm" or "keyword"
+    created: bool = False
+
+
+@dataclass
+class ExecutionResult:
+    """Result of executing a skill's commands."""
+
+    skill: Skill
+    command: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+    @property
+    def success(self) -> bool:
+        return self.returncode == 0
 
 
 class SkillRouter:
@@ -72,6 +93,7 @@ class SkillRouter:
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url or "https://api.openai.com/v1"
         self.workspace_dir = workspace_dir
+        self.manager = SkillManager(workspace_dir)
         self._system_prompt = build_system_prompt(
             skills, workspace_dir=workspace_dir,
         )
@@ -107,68 +129,12 @@ class SkillRouter:
             {"role": "user", "content": user_message},
         ]
 
-        # Ask the model to return structured JSON with skill selection/creation.
-        select_skill_tool = {
-            "type": "function",
-            "function": {
-                "name": "select_skill",
-                "description": (
-                    "Select the most appropriate skill for the user's request. "
-                    "Return the skill name and a brief response."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "skill_name": {
-                            "type": "string",
-                            "description": "Name of the selected skill, or empty string if none applies",
-                        },
-                        "response": {
-                            "type": "string",
-                            "description": "Your response to the user following the skill instructions",
-                        },
-                    },
-                    "required": ["skill_name", "response"],
-                },
-            },
-        }
-
-        create_skill_tool = {
-            "type": "function",
-            "function": {
-                "name": "create_skill",
-                "description": (
-                    "Create a new skill when none of the available skills fit the user's request."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "skill_name": {
-                            "type": "string",
-                            "description": "Short skill name (letters, numbers, dashes).",
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "One-line description for the new skill.",
-                        },
-                        "body": {
-                            "type": "string",
-                            "description": "SKILL.md body content for the new skill.",
-                        },
-                        "response": {
-                            "type": "string",
-                            "description": "Response to send to the user after skill creation.",
-                        },
-                    },
-                    "required": ["skill_name", "description", "body", "response"],
-                },
-            },
-        }
+        tools = self._build_llm_tools()
 
         completion = client.chat.completions.create(
             model=self.model,
             messages=messages,
-            tools=[select_skill_tool, create_skill_tool],
+            tools=tools,
         )
 
         choice = completion.choices[0]
@@ -181,25 +147,204 @@ class SkillRouter:
             except json.JSONDecodeError:
                 args = {"skill_name": "", "response": choice.message.content or ""}
 
-            if call.function.name == "create_skill":
-                created = self._create_skill_from_args(args)
-                selected = created
-                response_text = args.get("response", "")
-                if not response_text:
-                    if created:
-                        response_text = (
-                            f"[Skill: {created.name}] Created a new skill for this request."
-                        )
-                    else:
-                        response_text = "Couldn't create a new skill, so I'll continue without one."
-            else:
-                skill_name = args.get("skill_name", "")
-                selected = self._find_skill_by_name(skill_name)
-                response_text = args.get("response", "")
-        else:
-            selected = None
-            response_text = choice.message.content or ""
+            return self._handle_tool_call(call.function.name, args)
 
+        return RoutingResult(
+            selected_skill=None,
+            response=choice.message.content or "",
+            all_skills=self.skills,
+            mode="llm",
+        )
+
+    @staticmethod
+    def _build_llm_tools() -> list[dict]:
+        """Build the tool definitions sent to the LLM."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "select_skill",
+                    "description": (
+                        "Select the most appropriate skill for the user's request. "
+                        "Return the skill name and a brief response."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name of the selected skill, or empty string if none applies",
+                            },
+                            "response": {
+                                "type": "string",
+                                "description": "Your response to the user following the skill instructions",
+                            },
+                        },
+                        "required": ["skill_name", "response"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_skill",
+                    "description": (
+                        "Create a new skill when none of the available skills fit the user's request."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Short skill name (letters, numbers, dashes).",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "One-line description for the new skill.",
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "SKILL.md body content for the new skill.",
+                            },
+                            "response": {
+                                "type": "string",
+                                "description": "Response to send to the user after skill creation.",
+                            },
+                        },
+                        "required": ["skill_name", "description", "body", "response"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_skill",
+                    "description": "Update an existing skill's description or body content.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name of the skill to update.",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "New description (omit to keep current).",
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "New SKILL.md body (omit to keep current).",
+                            },
+                            "response": {
+                                "type": "string",
+                                "description": "Response to send to the user.",
+                            },
+                        },
+                        "required": ["skill_name", "response"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_skill",
+                    "description": "Delete a skill that is no longer needed.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name of the skill to delete.",
+                            },
+                            "response": {
+                                "type": "string",
+                                "description": "Response to send to the user.",
+                            },
+                        },
+                        "required": ["skill_name", "response"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_skills",
+                    "description": "List all available skills with their descriptions.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "response": {
+                                "type": "string",
+                                "description": "Response listing the skills for the user.",
+                            },
+                        },
+                        "required": ["response"],
+                    },
+                },
+            },
+        ]
+
+    def _handle_tool_call(self, tool_name: str, args: dict) -> RoutingResult:
+        """Dispatch a tool call from the LLM to the appropriate handler."""
+        response_text = args.get("response", "")
+
+        if tool_name == "create_skill":
+            created = self._create_skill_from_args(args)
+            if not response_text:
+                if created:
+                    response_text = f"[Skill: {created.name}] Created a new skill for this request."
+                else:
+                    response_text = "Couldn't create a new skill, so I'll continue without one."
+            return RoutingResult(
+                selected_skill=created,
+                response=response_text,
+                all_skills=self.skills,
+                mode="llm",
+                created=created is not None,
+            )
+
+        if tool_name == "update_skill":
+            name = args.get("skill_name", "")
+            updated = self.update_skill(
+                name,
+                description=args.get("description"),
+                body=args.get("body"),
+            )
+            if not response_text:
+                response_text = f"Updated skill '{name}'." if updated else f"Skill '{name}' not found."
+            return RoutingResult(
+                selected_skill=updated,
+                response=response_text,
+                all_skills=self.skills,
+                mode="llm",
+            )
+
+        if tool_name == "delete_skill":
+            name = args.get("skill_name", "")
+            deleted = self.delete_skill(name)
+            if not response_text:
+                response_text = f"Deleted skill '{name}'." if deleted else f"Skill '{name}' not found."
+            return RoutingResult(
+                selected_skill=None,
+                response=response_text,
+                all_skills=self.skills,
+                mode="llm",
+            )
+
+        if tool_name == "list_skills":
+            if not response_text:
+                names = ", ".join(s.name for s in self.skills) or "(none)"
+                response_text = f"Available skills: {names}"
+            return RoutingResult(
+                selected_skill=None,
+                response=response_text,
+                all_skills=self.skills,
+                mode="llm",
+            )
+
+        # Default: select_skill
+        skill_name = args.get("skill_name", "")
+        selected = self._find_skill_by_name(skill_name)
         return RoutingResult(
             selected_skill=selected,
             response=response_text,
@@ -319,7 +464,156 @@ class SkillRouter:
             body=body,
         )
         self.skills.append(created)
+        self.manager._skills[skill_name] = created
         self._system_prompt = build_system_prompt(
             self.skills, workspace_dir=self.workspace_dir,
         )
         return created
+
+    # ------------------------------------------------------------------
+    # Skill management (list, update, delete)
+    # ------------------------------------------------------------------
+
+    def list_skills(self) -> list[dict[str, str]]:
+        """Return a summary of all loaded skills."""
+        return [
+            {
+                "name": s.name,
+                "description": s.description,
+                "emoji": s.emoji,
+                "eligible": str(s.is_eligible()),
+                "file_path": s.file_path,
+            }
+            for s in self.skills
+        ]
+
+    def update_skill(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        body: str | None = None,
+        emoji: str | None = None,
+    ) -> Skill | None:
+        """Update an existing skill and rebuild the prompt."""
+        updated = self.manager.update(name, description=description, body=body, emoji=emoji)
+        if updated is None:
+            return None
+        # Sync the router's skills list
+        for i, s in enumerate(self.skills):
+            if s.name == name:
+                self.skills[i] = updated
+                break
+        self._system_prompt = build_system_prompt(
+            self.skills, workspace_dir=self.workspace_dir,
+        )
+        return updated
+
+    def delete_skill(self, name: str) -> bool:
+        """Delete a skill and rebuild the prompt."""
+        if not self.manager.delete(name):
+            return False
+        self.skills = [s for s in self.skills if s.name != name]
+        self._system_prompt = build_system_prompt(
+            self.skills, workspace_dir=self.workspace_dir,
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Skill execution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def extract_commands(skill: Skill) -> list[str]:
+        """Extract shell commands from fenced code blocks in a skill body.
+
+        Only code blocks tagged with an explicit shell language (bash, sh,
+        shell, zsh) are considered. Untagged code blocks are skipped to
+        avoid accidentally running non-shell code.
+        """
+        commands: list[str] = []
+        in_block = False
+        is_shell = False
+        current: list[str] = []
+
+        for line in skill.body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("```") and not in_block:
+                lang = stripped[3:].strip().lower()
+                is_shell = lang in ("bash", "sh", "shell", "zsh")
+                in_block = True
+                current = []
+            elif stripped == "```" and in_block:
+                if is_shell and current:
+                    commands.extend(current)
+                in_block = False
+                is_shell = False
+                current = []
+            elif in_block and is_shell:
+                # Skip comment-only lines
+                if stripped and not stripped.startswith("#"):
+                    current.append(line.rstrip())
+        return commands
+
+    def execute_skill(
+        self,
+        skill: Skill,
+        *,
+        command_index: int = 0,
+        timeout: int = 30,
+    ) -> ExecutionResult:
+        """Execute a shell command from a skill's code blocks.
+
+        Runs the command at *command_index* from the skill's extracted commands.
+        """
+        commands = self.extract_commands(skill)
+        if not commands:
+            return ExecutionResult(
+                skill=skill,
+                command="",
+                stdout="",
+                stderr="No executable commands found in skill body.",
+                returncode=1,
+            )
+        if command_index >= len(commands):
+            return ExecutionResult(
+                skill=skill,
+                command="",
+                stdout="",
+                stderr=f"Command index {command_index} out of range (skill has {len(commands)} commands).",
+                returncode=1,
+            )
+
+        cmd = commands[command_index]
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=self.workspace_dir,
+            )
+            return ExecutionResult(
+                skill=skill,
+                command=cmd,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                returncode=result.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return ExecutionResult(
+                skill=skill,
+                command=cmd,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s.",
+                returncode=124,
+            )
+        except OSError as exc:
+            return ExecutionResult(
+                skill=skill,
+                command=cmd,
+                stdout="",
+                stderr=str(exc),
+                returncode=1,
+            )
